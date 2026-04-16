@@ -1,0 +1,17 @@
+{
+  "name": "p3g",
+  "version": "0.1.0",
+  "description": "Cliente HTTP super leve com compatibilidade Axios e atalhos BR.",
+  "type": "module",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "scripts": {
+    "test": "node --test",
+    "lint": "node --check src/index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
