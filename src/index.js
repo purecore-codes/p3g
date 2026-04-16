@@ -11,9 +11,16 @@ class HttpError extends Error {
 }
 
 const METHOD_HAS_BODY = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+const READ_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 
 function withDefaults(value, fallback) {
   return value === undefined ? fallback : value;
+}
+
+function clonePlainObject(value) {
+  if (!value || typeof value !== 'object') return {};
+  if (Array.isArray(value)) return [...value];
+  return { ...value };
 }
 
 function joinUrl(baseURL = '', url = '') {
@@ -58,6 +65,26 @@ function createInterceptors() {
   };
 }
 
+function inferIntent(config) {
+  const method = (config.method || 'GET').toUpperCase();
+  if (READ_METHODS.has(method)) return 'read';
+  if (method === 'DELETE') return 'delete';
+  return 'write';
+}
+
+function applyAliasMap(target, aliasMap = {}) {
+  if (!target || typeof target !== 'object') return false;
+  let changed = false;
+  for (const [from, to] of Object.entries(aliasMap)) {
+    if (target[from] !== undefined && target[to] === undefined) {
+      target[to] = target[from];
+      delete target[from];
+      changed = true;
+    }
+  }
+  return changed;
+}
+
 class P3GClient extends EventEmitter {
   constructor(config = {}) {
     super();
@@ -79,6 +106,27 @@ class P3GClient extends EventEmitter {
         failureThreshold: 5,
         openForMs: 30_000
       },
+      healing: {
+        enabled: true,
+        maxSteps: 2,
+        timeoutMultiplier: 1.8,
+        statusRetries: {
+          408: 1,
+          425: 1,
+          429: 1,
+          500: 1,
+          502: 2,
+          503: 2,
+          504: 2
+        },
+        paramAliases: {},
+        bodyAliases: {},
+        intentStrategies: {
+          read: { allowMethodDowngrade: false },
+          write: { allowMethodDowngrade: true },
+          delete: { allowMethodDowngrade: false }
+        }
+      },
       slowMs: 2_000,
       ...config
     };
@@ -88,6 +136,7 @@ class P3GClient extends EventEmitter {
       response: createInterceptors()
     };
 
+    this._healingRules = [];
     this._cache = new Map();
     this._inflight = new Map();
     this._queue = [];
@@ -102,6 +151,16 @@ class P3GClient extends EventEmitter {
 
   create(config = {}) {
     return createP3G({ ...this.defaults, ...config });
+  }
+
+  useHealingRule(ruleFn) {
+    if (typeof ruleFn !== 'function') throw new TypeError('healing rule deve ser função');
+    this._healingRules.push(ruleFn);
+    return this._healingRules.length - 1;
+  }
+
+  ejectHealingRule(index) {
+    if (this._healingRules[index]) this._healingRules[index] = null;
   }
 
   _canAttemptRequest() {
@@ -174,6 +233,19 @@ class P3GClient extends EventEmitter {
       headers: {
         ...(this.defaults.headers || {}),
         ...(rawConfig.headers || {})
+      },
+      _healing: {
+        step: 0,
+        stepsApplied: [],
+        statusRetries: {},
+        ...(rawConfig._healing || {})
+      }
+    });
+
+    return this._executeWithQueue(() => this._requestWithRecovery(config), config);
+  }
+
+  async _requestWithRecovery(config) {
       }
     });
 
@@ -185,6 +257,49 @@ class P3GClient extends EventEmitter {
     const maxRetries = retry.retries;
 
     let attempt = 0;
+    let activeConfig = config;
+    let lastError;
+
+    while (attempt <= maxRetries) {
+      if (attempt > 0) this.emit('retry', activeConfig, attempt);
+      try {
+        const result = await this._doFetch(activeConfig);
+
+        if (result._needsRetry) {
+          const healed = await this._maybeHeal(activeConfig, {
+            type: 'status',
+            status: result.status,
+            response: result
+          });
+          if (healed) {
+            activeConfig = healed;
+            continue;
+          }
+
+          if (!retry.retryOn?.(result.status) || attempt === maxRetries) return result;
+          await new Promise((resolve) => setTimeout(resolve, retry.delay * Math.max(1, attempt)));
+          attempt += 1;
+          continue;
+        }
+
+        return result;
+      } catch (error) {
+        lastError = error;
+
+        const healed = await this._maybeHeal(activeConfig, {
+          type: 'error',
+          error
+        });
+
+        if (healed) {
+          activeConfig = healed;
+          continue;
+        }
+
+        if (attempt === maxRetries) break;
+        await new Promise((resolve) => setTimeout(resolve, retry.delay * (attempt + 1)));
+        attempt += 1;
+      }
     let lastError;
 
     while (attempt <= maxRetries) {
@@ -204,6 +319,17 @@ class P3GClient extends EventEmitter {
     }
 
     throw lastError;
+  }
+
+  _createResponse(raw, data, config, requestInfo) {
+    return {
+      data,
+      status: raw.status,
+      statusText: raw.statusText,
+      headers: Object.fromEntries(raw.headers.entries()),
+      config,
+      request: requestInfo
+    };
   }
 
   async _doFetch(config) {
@@ -235,6 +361,7 @@ class P3GClient extends EventEmitter {
 
       const contentType = raw.headers.get('content-type') || '';
       const data = contentType.includes('application/json') ? await raw.json() : await raw.text();
+      const response = this._createResponse(raw, data, config, { url, method });
 
       const response = {
         data,
@@ -251,6 +378,8 @@ class P3GClient extends EventEmitter {
       }
 
       if (!config.validateStatus(raw.status)) {
+        response._needsRetry = true;
+        return response;
         this._registerFailure();
         const error = new HttpError(`Request falhou com status ${raw.status}`, response, config);
         const transformedError = await this.interceptors.response.run(error, true);
@@ -265,6 +394,113 @@ class P3GClient extends EventEmitter {
     } finally {
       clearTimeout(timeout);
     }
+  }
+
+  async _maybeHeal(config, context) {
+    const healing = { ...this.defaults.healing, ...(config.healing || {}) };
+    if (!healing.enabled) return null;
+
+    const currentMeta = {
+      step: config._healing?.step || 0,
+      stepsApplied: [...(config._healing?.stepsApplied || [])],
+      statusRetries: { ...(config._healing?.statusRetries || {}) }
+    };
+
+    if (currentMeta.step >= healing.maxSteps) return null;
+
+    const intent = config.intent || inferIntent(config);
+    let nextConfig = {
+      ...config,
+      intent,
+      params: clonePlainObject(config.params),
+      data: clonePlainObject(config.data)
+    };
+
+    let healedStep = null;
+
+    if (context.type === 'error' && context.error?.name === 'AbortError') {
+      nextConfig.timeout = Math.round((config.timeout || this.defaults.timeout) * healing.timeoutMultiplier);
+      healedStep = `timeout:x${healing.timeoutMultiplier}`;
+    }
+
+    if (!healedStep && context.type === 'status') {
+      const status = context.status;
+      const retries = currentMeta.statusRetries[status] || 0;
+      const allowed = healing.statusRetries?.[status] || 0;
+      if (allowed > retries) {
+        currentMeta.statusRetries[status] = retries + 1;
+        healedStep = `status-retry:${status}:${retries + 1}`;
+      }
+
+      if (!healedStep && status === 404 && Array.isArray(config.fallbackUrls) && config.fallbackUrls.length > 0) {
+        const fallbackIndex = config._fallbackIndex || 0;
+        if (fallbackIndex < config.fallbackUrls.length) {
+          nextConfig.url = config.fallbackUrls[fallbackIndex];
+          nextConfig._fallbackIndex = fallbackIndex + 1;
+          healedStep = `fallback-url:${fallbackIndex}`;
+        }
+      }
+
+      if (!healedStep && status === 422) {
+        const bodyFixed = applyAliasMap(nextConfig.data, healing.bodyAliases);
+        const paramsFixed = applyAliasMap(nextConfig.params, healing.paramAliases);
+        if (bodyFixed || paramsFixed) healedStep = 'alias-map:422';
+      }
+
+      if (!healedStep && status === 405) {
+        if (Array.isArray(config.fallbackUrls) && config.fallbackUrls.length > 0) {
+          const fallbackIndex = config._fallbackIndex || 0;
+          if (fallbackIndex < config.fallbackUrls.length) {
+            nextConfig.url = config.fallbackUrls[fallbackIndex];
+            nextConfig._fallbackIndex = fallbackIndex + 1;
+            healedStep = `fallback-url-405:${fallbackIndex}`;
+          }
+        }
+
+        if (!healedStep) {
+          const strategy = healing.intentStrategies?.[intent];
+          const method = (config.method || 'GET').toUpperCase();
+          if (strategy?.allowMethodDowngrade && method === 'POST') {
+            nextConfig.method = 'PUT';
+            healedStep = 'method-downgrade:POST->PUT';
+          }
+        }
+      }
+    }
+
+    if (!healedStep && this._healingRules.length) {
+      for (const rule of this._healingRules) {
+        if (!rule) continue;
+        const result = await rule({ config: nextConfig, context, intent, defaults: this.defaults });
+        if (!result) continue;
+        nextConfig = { ...nextConfig, ...result.config };
+        healedStep = result.reason || 'custom-rule';
+        break;
+      }
+    }
+
+    if (!healedStep) return null;
+
+    const appliedKey = `${intent}:${healedStep}`;
+    if (currentMeta.stepsApplied.includes(appliedKey)) return null;
+
+    const healedConfig = {
+      ...nextConfig,
+      _healing: {
+        ...currentMeta,
+        step: currentMeta.step + 1,
+        stepsApplied: [...currentMeta.stepsApplied, appliedKey]
+      }
+    };
+
+    this.emit('healed', {
+      intent,
+      reason: healedStep,
+      from: { method: config.method, url: config.url, timeout: config.timeout },
+      to: { method: healedConfig.method, url: healedConfig.url, timeout: healedConfig.timeout }
+    });
+
+    return healedConfig;
   }
 
   memo(url, config = {}, ttlMs = 1_000) {
