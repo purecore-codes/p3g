@@ -246,6 +246,13 @@ class P3GClient extends EventEmitter {
   }
 
   async _requestWithRecovery(config) {
+      }
+    });
+
+    return this._executeWithQueue(() => this._requestWithRetry(config), config);
+  }
+
+  async _requestWithRetry(config) {
     const retry = { ...this.defaults.retry, ...(config.retry || {}) };
     const maxRetries = retry.retries;
 
@@ -293,6 +300,22 @@ class P3GClient extends EventEmitter {
         await new Promise((resolve) => setTimeout(resolve, retry.delay * (attempt + 1)));
         attempt += 1;
       }
+    let lastError;
+
+    while (attempt <= maxRetries) {
+      if (attempt > 0) this.emit('retry', config, attempt);
+      try {
+        const response = await this._doFetch(config);
+        if (!retry.retryOn?.(response.status) || attempt === maxRetries) {
+          return response;
+        }
+        await new Promise((resolve) => setTimeout(resolve, retry.delay * attempt));
+      } catch (error) {
+        lastError = error;
+        if (attempt === maxRetries) break;
+        await new Promise((resolve) => setTimeout(resolve, retry.delay * (attempt + 1)));
+      }
+      attempt += 1;
     }
 
     throw lastError;
@@ -340,6 +363,15 @@ class P3GClient extends EventEmitter {
       const data = contentType.includes('application/json') ? await raw.json() : await raw.text();
       const response = this._createResponse(raw, data, config, { url, method });
 
+      const response = {
+        data,
+        status: raw.status,
+        statusText: raw.statusText,
+        headers: Object.fromEntries(raw.headers.entries()),
+        config,
+        request: { url, method }
+      };
+
       if (raw.status === 401 && typeof config.onUnauthorizedRefresh === 'function' && !config._retryAfterRefresh) {
         await config.onUnauthorizedRefresh();
         return this.request({ ...config, _retryAfterRefresh: true });
@@ -348,6 +380,10 @@ class P3GClient extends EventEmitter {
       if (!config.validateStatus(raw.status)) {
         response._needsRetry = true;
         return response;
+        this._registerFailure();
+        const error = new HttpError(`Request falhou com status ${raw.status}`, response, config);
+        const transformedError = await this.interceptors.response.run(error, true);
+        throw transformedError;
       }
 
       this._registerSuccess();
@@ -543,11 +579,13 @@ function createP3G(config = {}) {
   const client = new P3GClient(config);
 
   const callable = async (url, configOrData = {}, maybeConfig = undefined) => {
+    // p3g('/rota') => GET + data
     if (typeof configOrData === 'object' && !Array.isArray(configOrData) && maybeConfig === undefined) {
       const response = await client.get(url, configOrData);
       return response.data;
     }
 
+    // p3g('/rota', data, config) => POST
     const response = await client.post(url, configOrData, maybeConfig || {});
     return response.data;
   };
