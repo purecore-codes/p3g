@@ -242,13 +242,6 @@ class P3GClient extends EventEmitter {
       }
     });
 
-    return this._executeWithQueue(() => this._requestWithRecovery(config), config);
-  }
-
-  async _requestWithRecovery(config) {
-      }
-    });
-
     return this._executeWithQueue(() => this._requestWithRetry(config), config);
   }
 
@@ -276,13 +269,20 @@ class P3GClient extends EventEmitter {
             continue;
           }
 
-          if (!retry.retryOn?.(result.status) || attempt === maxRetries) return result;
+          if (!retry.retryOn?.(result.status) || attempt === maxRetries) {
+            // Se atingir o limite e falhar, registramos falha e transformamos em erro real
+            this._registerFailure();
+            const error = new HttpError(`Request falhou com status ${result.status}`, result, activeConfig);
+            throw await this.interceptors.response.run(error, true);
+          }
+
           await new Promise((resolve) => setTimeout(resolve, retry.delay * Math.max(1, attempt)));
           attempt += 1;
           continue;
         }
 
-        return result;
+        this._registerSuccess();
+        return this.interceptors.response.run(result);
       } catch (error) {
         lastError = error;
 
@@ -296,26 +296,11 @@ class P3GClient extends EventEmitter {
           continue;
         }
 
-        if (attempt === maxRetries) break;
+        this._registerFailure();
+        if (attempt === maxRetries) throw error;
         await new Promise((resolve) => setTimeout(resolve, retry.delay * (attempt + 1)));
         attempt += 1;
       }
-    let lastError;
-
-    while (attempt <= maxRetries) {
-      if (attempt > 0) this.emit('retry', config, attempt);
-      try {
-        const response = await this._doFetch(config);
-        if (!retry.retryOn?.(response.status) || attempt === maxRetries) {
-          return response;
-        }
-        await new Promise((resolve) => setTimeout(resolve, retry.delay * attempt));
-      } catch (error) {
-        lastError = error;
-        if (attempt === maxRetries) break;
-        await new Promise((resolve) => setTimeout(resolve, retry.delay * (attempt + 1)));
-      }
-      attempt += 1;
     }
 
     throw lastError;
@@ -363,34 +348,18 @@ class P3GClient extends EventEmitter {
       const data = contentType.includes('application/json') ? await raw.json() : await raw.text();
       const response = this._createResponse(raw, data, config, { url, method });
 
-      const response = {
-        data,
-        status: raw.status,
-        statusText: raw.statusText,
-        headers: Object.fromEntries(raw.headers.entries()),
-        config,
-        request: { url, method }
-      };
-
       if (raw.status === 401 && typeof config.onUnauthorizedRefresh === 'function' && !config._retryAfterRefresh) {
         await config.onUnauthorizedRefresh();
+        clearTimeout(timeout);
         return this.request({ ...config, _retryAfterRefresh: true });
       }
 
       if (!config.validateStatus(raw.status)) {
         response._needsRetry = true;
         return response;
-        this._registerFailure();
-        const error = new HttpError(`Request falhou com status ${raw.status}`, response, config);
-        const transformedError = await this.interceptors.response.run(error, true);
-        throw transformedError;
       }
 
-      this._registerSuccess();
-      return this.interceptors.response.run(response);
-    } catch (err) {
-      this._registerFailure();
-      throw err;
+      return response;
     } finally {
       clearTimeout(timeout);
     }
