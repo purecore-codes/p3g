@@ -18,13 +18,14 @@ async function startServer() {
       res.end(JSON.stringify({ ok: true, method: req.method, query: url.search }));
       return;
     }
-
-    if (url.pathname === '/echo' && req.method === 'POST') {
+    if (url.pathname === '/echo') {
       let payload = '';
       req.on('data', (chunk) => (payload += chunk));
       await once(req, 'end');
       res.setHeader('content-type', 'application/json');
-      res.end(payload || '{}');
+      let data = {};
+      try { data = JSON.parse(payload); } catch {}
+      res.end(JSON.stringify({ ...data, method: req.method }));
       return;
     }
 
@@ -139,6 +140,32 @@ test('compatibilidade axios + atalhos BR', async (t) => {
 
   const directData = await p3g('/users', { params: { id: 9 } });
   assert.match(directData.query, /id=9/);
+
+  // Nova assinatura: p3g(url, method, json)
+  const postData = await p3g('/echo', 'POST', { call: 'signature' });
+  assert.equal(postData.call, 'signature');
+
+  const putData = await p3g('/echo', 'PUT', { call: 'put' });
+  assert.equal(putData.method, 'PUT'); // O servidor de teste echo não retorna o body em PUT, mas vamos ajustar o server se precisar
+});
+
+test('Delete Strategies (Soft/Hard)', async (t) => {
+  const { server, baseURL } = await startServer();
+  t.after(() => server.close());
+
+  const p3g = createP3G({ baseURL, deleteStrategy: 'soft', softDeleteMethod: 'PATCH' });
+
+  // Soft delete padrão usa PATCH
+  const resSoft = await p3g.delete('/users');
+  assert.equal(resSoft.request.method, 'PATCH');
+
+  // Hard delete usa DELETE literal
+  const resHard = await p3g.hardDelete('/users');
+  assert.equal(resHard.request.method, 'DELETE');
+
+  // Override via config
+  const resHardOverride = await p3g.delete('/users', { deleteStrategy: 'hard' });
+  assert.equal(resHardOverride.request.method, 'DELETE');
 });
 
 test('Interceptors work', async (t) => {

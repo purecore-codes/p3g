@@ -127,6 +127,8 @@ class P3GClient extends EventEmitter {
           delete: { allowMethodDowngrade: false }
         }
       },
+      deleteStrategy: 'soft', // 'soft' ou 'hard'
+      softDeleteMethod: 'PATCH', // 'PATCH' ou 'PUT'
       slowMs: 2_000,
       ...config
     };
@@ -502,6 +504,17 @@ class P3GClient extends EventEmitter {
   }
 
   delete(url, config = {}) {
+    const strategy = config.deleteStrategy || this.defaults.deleteStrategy;
+    if (strategy === 'soft') {
+      const method = config.softDeleteMethod || this.defaults.softDeleteMethod || 'PATCH';
+      // In soft delete, we often send a body like { deletedAt: new Date() } 
+      // but here we just route to the right method.
+      return this.request({ ...config, method, url });
+    }
+    return this.hardDelete(url, config);
+  }
+
+  hardDelete(url, config = {}) {
     return this.request({ ...config, method: 'DELETE', url });
   }
 
@@ -547,15 +560,29 @@ class P3GClient extends EventEmitter {
 function createP3G(config = {}) {
   const client = new P3GClient(config);
 
-  const callable = async (url, configOrData = {}, maybeConfig = undefined) => {
-    // p3g('/rota') => GET + data
-    if (typeof configOrData === 'object' && !Array.isArray(configOrData) && maybeConfig === undefined) {
-      const response = await client.get(url, configOrData);
+  const callable = async (url, configOrMethodOrData = {}, maybeConfigOrData = undefined, maybeConfig = undefined) => {
+    const methods = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'];
+    
+    // p3g('/rota', 'POST', { json })
+    if (typeof configOrMethodOrData === 'string' && methods.includes(configOrMethodOrData.toUpperCase())) {
+      const method = configOrMethodOrData.toUpperCase();
+      const response = await client.request({ 
+        ...maybeConfig,
+        method, 
+        url, 
+        data: maybeConfigOrData 
+      });
       return response.data;
     }
 
-    // p3g('/rota', data, config) => POST
-    const response = await client.post(url, configOrData, maybeConfig || {});
+    // p3g('/rota') ou p3g('/rota', { config }) => GET
+    if (typeof configOrMethodOrData === 'object' && !Array.isArray(configOrMethodOrData) && maybeConfigOrData === undefined) {
+      const response = await client.get(url, configOrMethodOrData);
+      return response.data;
+    }
+
+    // p3g('/rota', { data }, { config }) => POST
+    const response = await client.post(url, configOrMethodOrData, maybeConfigOrData || {});
     return response.data;
   };
 

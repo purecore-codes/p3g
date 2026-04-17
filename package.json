@@ -7,6 +7,10 @@
   "exports": {
     ".": "./src/index.js"
   },
+  "bin": {
+    "p3g": "./src/index.js",
+    "r3q": "./src/index.js"
+  },
   "scripts": {
     "test": "node --test",
     "lint": "node --check src/index.js"
