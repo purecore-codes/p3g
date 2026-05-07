@@ -1,4 +1,5 @@
 import { EventEmitter } from 'node:events';
+import fs from 'node:fs/promises';
 
 class HttpError extends Error {
   constructor(message, response, config) {
@@ -88,6 +89,8 @@ function applyAliasMap(target, aliasMap = {}) {
 class P3GClient extends EventEmitter {
   constructor(config = {}) {
     super();
+    this._debounces = new Map();
+    this._throttles = new Map();
     this.defaults = {
       baseURL: '',
       headers: {},
@@ -229,6 +232,42 @@ class P3GClient extends EventEmitter {
       throw new Error('Circuit breaker aberto: requisição bloqueada temporariamente.');
     }
 
+    const mergedConfig = { ...this.defaults, ...rawConfig };
+    const method = (mergedConfig.method || 'GET').toUpperCase();
+    const requestKey = `${method}:${mergedConfig.url}`;
+
+    if (mergedConfig.throttle) {
+      const lastCall = this._throttles.get(requestKey) || 0;
+      const now = Date.now();
+      if (now - lastCall < mergedConfig.throttle) {
+        return Promise.reject(new Error(`Throttled: Request to ${requestKey} blocked.`));
+      }
+      this._throttles.set(requestKey, now);
+    }
+
+    if (mergedConfig.debounce) {
+      return new Promise((resolve, reject) => {
+        if (this._debounces.has(requestKey)) {
+          clearTimeout(this._debounces.get(requestKey).timeout);
+          this._debounces.get(requestKey).reject(new Error('Debounced'));
+        }
+        const timeout = setTimeout(async () => {
+          this._debounces.delete(requestKey);
+          try {
+            const result = await this._processRequestAndQueue(rawConfig);
+            resolve(result);
+          } catch (e) {
+            reject(e);
+          }
+        }, mergedConfig.debounce);
+        this._debounces.set(requestKey, { timeout, resolve, reject });
+      });
+    }
+
+    return this._processRequestAndQueue(rawConfig);
+  }
+
+  async _processRequestAndQueue(rawConfig) {
     const config = await this.interceptors.request.run({
       ...this.defaults,
       ...rawConfig,
@@ -249,11 +288,16 @@ class P3GClient extends EventEmitter {
 
   async _requestWithRetry(config) {
     const retry = { ...this.defaults.retry, ...(config.retry || {}) };
-    const maxRetries = retry.retries;
+    let maxRetries = retry.retries;
+    if (maxRetries === 'outbox') {
+      maxRetries = Infinity;
+    }
+    const dlqConfig = config.dlq || this.defaults.dlq || { threshold: Infinity };
 
     let attempt = 0;
     let activeConfig = config;
     let lastError;
+    let dlqLogged = false;
 
     while (attempt <= maxRetries) {
       if (attempt > 0) this.emit('retry', activeConfig, attempt);
@@ -271,14 +315,25 @@ class P3GClient extends EventEmitter {
             continue;
           }
 
+          if (attempt >= dlqConfig.threshold && !dlqLogged) {
+            try {
+              const dlqLog = { timestamp: new Date().toISOString(), url: activeConfig.url, method: activeConfig.method, data: activeConfig.data, params: activeConfig.params, status: result.status, attempt };
+              await fs.appendFile('dlq.json', JSON.stringify(dlqLog) + '\n');
+              dlqLogged = true;
+            } catch (e) { console.error('Failed to write to DLQ:', e); }
+          }
+
           if (!retry.retryOn?.(result.status) || attempt === maxRetries) {
-            // Se atingir o limite e falhar, registramos falha e transformamos em erro real
             this._registerFailure();
             const error = new HttpError(`Request falhou com status ${result.status}`, result, activeConfig);
             throw await this.interceptors.response.run(error, true);
           }
 
-          await new Promise((resolve) => setTimeout(resolve, retry.delay * Math.max(1, attempt)));
+          let delayMs = retry.delay;
+          if (Array.isArray(retry.delay) && retry.delay.length === 2) {
+            delayMs = Math.floor(Math.random() * (retry.delay[1] - retry.delay[0] + 1)) + retry.delay[0];
+          }
+          await new Promise((resolve) => setTimeout(resolve, delayMs * Math.max(1, attempt)));
           attempt += 1;
           continue;
         }
@@ -298,9 +353,22 @@ class P3GClient extends EventEmitter {
           continue;
         }
 
+        if (attempt >= dlqConfig.threshold && !dlqLogged) {
+          try {
+            const dlqLog = { timestamp: new Date().toISOString(), url: activeConfig.url, method: activeConfig.method, data: activeConfig.data, params: activeConfig.params, error: lastError.message, attempt };
+            await fs.appendFile('dlq.json', JSON.stringify(dlqLog) + '\n');
+            dlqLogged = true;
+          } catch (e) { console.error('Failed to write to DLQ:', e); }
+        }
+
         this._registerFailure();
         if (attempt === maxRetries) throw error;
-        await new Promise((resolve) => setTimeout(resolve, retry.delay * (attempt + 1)));
+
+        let delayMs = retry.delay;
+        if (Array.isArray(retry.delay) && retry.delay.length === 2) {
+          delayMs = Math.floor(Math.random() * (retry.delay[1] - retry.delay[0] + 1)) + retry.delay[0];
+        }
+        await new Promise((resolve) => setTimeout(resolve, delayMs * (attempt + 1)));
         attempt += 1;
       }
     }
@@ -557,13 +625,53 @@ class P3GClient extends EventEmitter {
   }
 }
 
+
+async function fetchOpenApi(api) {
+  try {
+    const raw = await fetch(`${api}/openapi.json`);
+    return await raw.json();
+  } catch (e) {
+    return null;
+  }
+}
+
+function validatePayload(payload, schema, openapi) {
+  if (!schema) return true;
+  if (schema.$ref) {
+    const refPath = schema.$ref.replace('#/', '').split('/');
+    let resolved = openapi;
+    for (const part of refPath) {
+      if (resolved) resolved = resolved[part];
+    }
+    return validatePayload(payload, resolved, openapi);
+  }
+  if (schema.type === 'object' && schema.properties) {
+    if (typeof payload !== 'object' || payload === null) return false;
+    if (schema.required) {
+      for (const req of schema.required) {
+        if (payload[req] === undefined) return false;
+      }
+    }
+    for (const [key, propSchema] of Object.entries(schema.properties)) {
+      if (payload[key] !== undefined) {
+        if (!validatePayload(payload[key], propSchema, openapi)) return false;
+      }
+    }
+  }
+  if (schema.type === 'string' && typeof payload !== 'string') return false;
+  if (schema.type === 'integer' && typeof payload !== 'number') return false;
+  if (schema.type === 'number' && typeof payload !== 'number') return false;
+  if (schema.type === 'boolean' && typeof payload !== 'boolean') return false;
+  if (schema.type === 'array' && !Array.isArray(payload)) return false;
+
+  return true;
+}
+
 function createP3G(config = {}) {
   const client = new P3GClient(config);
 
   const callable = async (url, configOrMethodOrData = {}, maybeConfigOrData = undefined, maybeConfig = undefined) => {
     const methods = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'];
-    
-    // p3g('/rota', 'POST', { json })
     if (typeof configOrMethodOrData === 'string' && methods.includes(configOrMethodOrData.toUpperCase())) {
       const method = configOrMethodOrData.toUpperCase();
       const response = await client.request({ 
@@ -574,14 +682,10 @@ function createP3G(config = {}) {
       });
       return response.data;
     }
-
-    // p3g('/rota') ou p3g('/rota', { config }) => GET
     if (typeof configOrMethodOrData === 'object' && !Array.isArray(configOrMethodOrData) && maybeConfigOrData === undefined) {
       const response = await client.get(url, configOrMethodOrData);
       return response.data;
     }
-
-    // p3g('/rota', { data }, { config }) => POST
     const response = await client.post(url, configOrMethodOrData, maybeConfigOrData || {});
     return response.data;
   };
@@ -597,6 +701,58 @@ function createP3G(config = {}) {
 
   callable.defaults = client.defaults;
   callable.interceptors = client.interceptors;
+
+  if (config.api && config.entity) {
+    let openapiCache = null;
+    let openapiPromise = null;
+
+    return new Proxy(callable, {
+      get(target, prop) {
+        const semanticMethods = ['list', 'get', 'create', 'update', 'delete'];
+        if (prop in target && !semanticMethods.includes(prop)) {
+          return target[prop];
+        }
+
+        return async (payloadOrParams) => {
+          if (!openapiPromise) openapiPromise = fetchOpenApi(config.api);
+          openapiCache = await openapiPromise;
+
+          const paths = openapiCache?.paths || {};
+          const resolvedBasePath = paths[`/${config.entity}s`] ? `/${config.entity}s` : `/${config.entity}`;
+
+          if (prop === 'list') return (await client.get(resolvedBasePath, { params: payloadOrParams })).data;
+          if (prop === 'get' && payloadOrParams?.id) return (await client.get(resolvedBasePath, { params: payloadOrParams })).data;
+          if (prop === 'create') {
+             const schema = paths[resolvedBasePath]?.post?.requestBody?.content?.['application/json']?.schema;
+             if (schema && !validatePayload(payloadOrParams, schema, openapiCache)) throw new Error(`Invalid payload for create`);
+             return (await client.post(resolvedBasePath, payloadOrParams)).data;
+          }
+          if (prop === 'update') {
+             const schema = paths[resolvedBasePath]?.put?.requestBody?.content?.['application/json']?.schema;
+             if (schema && !validatePayload(payloadOrParams, schema, openapiCache)) throw new Error(`Invalid payload for update`);
+             return (await client.put(resolvedBasePath, payloadOrParams)).data;
+          }
+          if (prop === 'delete') {
+             return (await client.delete(resolvedBasePath, { data: payloadOrParams })).data;
+          }
+
+          const customPath = `${resolvedBasePath}/${prop}`;
+          if (paths[customPath]?.post) {
+            const schema = paths[customPath].post.requestBody?.content?.['application/json']?.schema;
+            if (schema && !validatePayload(payloadOrParams, schema, openapiCache)) throw new Error(`Invalid payload for ${prop}`);
+            return (await client.post(customPath, payloadOrParams)).data;
+          }
+          if (paths[customPath]?.get) {
+            return (await client.get(customPath, { params: payloadOrParams })).data;
+          }
+
+          if (prop in target) return target[prop];
+
+          throw new Error(`Method ${prop} not found in OpenAPI or standard mapping`);
+        };
+      }
+    });
+  }
 
   return callable;
 }
